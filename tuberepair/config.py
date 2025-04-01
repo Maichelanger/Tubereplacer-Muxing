@@ -1,6 +1,6 @@
 # -- DEV ZONE -- #
 # You can change this to anything
-import os
+import os, random, string
 from modules import helpers
 from requests_cache import RedisCache
 VERSION = "v0.0.8-beta"
@@ -9,6 +9,16 @@ VERSION = "v0.0.8-beta"
 # -- General -- #
 
 OSEnv = os.environ
+
+if os.path.exists("serverID.txt"):
+    id_file = open("serverID.txt", "r")
+    SERVER_ID = id_file.readline()
+    id_file.close()
+else:
+    id_file = open("serverID.txt", "w")
+    SERVER_ID = ''.join(random.SystemRandom().choice(string.ascii_uppercase + string.digits) for i in range(10))
+    id_file.write(SERVER_ID)
+    id_file.close()
 
 if "USE_REDIS" in OSEnv:
     USE_REDIS = helpers.string_to_bool(OSEnv["USE_REDIS"])

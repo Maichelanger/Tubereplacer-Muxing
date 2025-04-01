@@ -38,6 +38,7 @@ def catch_docker_stop(*args):
 
 # config
 if __name__ == "__main__":
+    print("This Instance ID is ", config.SERVER_ID)
     signal.signal(signal.SIGTERM, catch_docker_stop)
     if config.DEBUG:
         app.run(port=config.PORT, host="0.0.0.0", debug=True)

@@ -11,7 +11,7 @@ key = uuid4().hex
 
 @static.route("/")
 def index(res=None):
-    return render_template('web/index.html', version=config.VERSION, medium=config.MEDIUM_QUALITY, hls=config.HLS_RESOLUTION)
+    return render_template('web/index.html', version=config.VERSION, medium=config.MEDIUM_QUALITY, hls=config.HLS_RESOLUTION, serverID=config.SERVER_ID)
 
 # sidebar menu
 @static.route("/schemas/2007/categories.cat")
