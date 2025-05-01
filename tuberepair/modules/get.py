@@ -13,10 +13,19 @@ from .logs import print_with_seperator
 session = CachedSession('cache/info', expire_after=timedelta(hours=1), backend=config.backend)
 
 def unix(unix):
+    if is_iso(unix):
+        return unix
     return datetime.fromtimestamp(int(unix)).isoformat() + '.000Z'
 
 def unix_now(): # Will be used in another update
     return datetime.now().isoformat() + '.000Z'
+
+def is_iso(str):
+    try:
+        datetime.fromisoformat(str)
+        return True
+    except:
+        return False
 
 # jinja2 path
 env = Environment(loader=FileSystemLoader('templates'))
