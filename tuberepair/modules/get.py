@@ -15,7 +15,7 @@ session = CachedSession('cache/info', expire_after=timedelta(hours=1), backend=c
 def unix(unix):
     if is_iso(unix):
         return unix
-    return datetime.fromtimestamp(int(unix)).isoformat() + '.000Z'
+    return datetime.fromtimestamp(int(unix or 0)).isoformat() + '.000Z'
 
 def unix_now(): # Will be used in another update
     return datetime.now().isoformat() + '.000Z'
