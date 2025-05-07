@@ -152,11 +152,14 @@ class metadata:
 
         # fetch the API.
         data = session.post('https://www.youtube.com/youtubei/v1/browse?key=' + api_key, json=json_data).json()
-
+        try:
+            subs = get.subscribers(data['header']['pageHeaderRenderer']['content']['pageHeaderViewModel']['metadata']['contentMetadataViewModel']['metadataRows'][1]['metadataParts'][0]['text']['content'])
+        except:
+            subs = -1
         # i'm lazy. again.
         return {
             "name": data['header']['pageHeaderRenderer']['pageTitle'],
             "channel_id": data['contents']['twoColumnBrowseResultsRenderer']['tabs'][0]['tabRenderer']['endpoint']['browseEndpoint']['browseId'],
             "profile_picture": data['header']['pageHeaderRenderer']['content']['pageHeaderViewModel']['image']['decoratedAvatarViewModel']['avatar']['avatarViewModel']['image']['sources'][0]['url'],
-            "subscribers": get.subscribers(data['header']['pageHeaderRenderer']['content']['pageHeaderViewModel']['metadata']['contentMetadataViewModel']['metadataRows'][1]['metadataParts'][0]['text']['content'])
+            "subscribers": subs
         }
