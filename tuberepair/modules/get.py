@@ -13,19 +13,21 @@ from .logs import print_with_seperator
 session = CachedSession('cache/info', expire_after=timedelta(hours=1), backend=config.backend)
 
 def unix(unix):
-    if is_iso(unix):
-        return unix
-    return datetime.fromtimestamp(int(unix or 0)).isoformat() + '.000Z'
+    return convert_with_mili(unix)
 
 def unix_now(): # Will be used in another update
-    return datetime.now().isoformat() + '.000Z'
+    return tostring_with_mili(datetime.now())
 
-def is_iso(str):
+def tostring_with_mili(dt):
+    # Needs to be formated this way or else YouTube app refuses to load it.
+    return dt.strftime('%Y-%m-%dT%H:%M:%S.000Z')
+
+def convert_with_mili(str):
     try:
-        datetime.fromisoformat(str)
-        return True
+        dt = datetime.fromisoformat(str)
     except:
-        return False
+        dt = datetime.fromtimestamp(int(str or 0))
+    return tostring_with_mili(dt)
 
 # jinja2 path
 env = Environment(loader=FileSystemLoader('templates'))
