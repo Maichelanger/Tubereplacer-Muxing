@@ -9,7 +9,8 @@ channel = Blueprint("channel", __name__)
 @channel.route("/feeds/api/channels/<channel_id>")
 @channel.route("/<int:res>/feeds/api/channels/<channel_id>")
 def search(channel_id, res=''):
-    
+    if not channel_id:
+        return get.error()
     # Clamp Res
     if type(res) == int:
         res = min(max(res, 144), config.RESMAX)
@@ -74,7 +75,8 @@ def channels(res=''):
 @channel.route("/feeds/api/users/<channel_id>/uploads")
 @channel.route("/<int:res>/feeds/api/users/<channel_id>/uploads")
 def uploads(channel_id, res=''):
-    
+    if not channel_id:
+        return get.error()
     # Clamp Res
     if type(res) == int:
         res = min(max(res, 144), config.RESMAX)

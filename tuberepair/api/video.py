@@ -217,6 +217,12 @@ else:
 
             return Response(yt.hls_video_url(video_id, res), mimetype="application/vnd.apple.mpegurl")
         '''
+        # Let's start logging this.
+        if not data or 'formatStreams' not in data:
+            if config.GET_ERROR_LOGGING:
+                print_with_seperator(f"/getvideo/{video_id} had no formatStreams")
+            return get.error()
+        
         # 360p if enabled
         # TODO: Fix resoution not working.
         return redirect(data['formatStreams'][0]['url'], 307)
