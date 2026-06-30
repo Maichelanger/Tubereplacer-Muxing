@@ -1,8 +1,9 @@
 from modules import get, helpers
-from flask import Blueprint, Flask, request, redirect, render_template, Response
+from flask import Blueprint, Flask, request, redirect, render_template, Response, send_file
 import config
 from modules.logs import print_with_seperator
 from modules import yt
+import os
 
 video = Blueprint("video", __name__)
 
@@ -185,21 +186,22 @@ def comments(videoid, res=''):
     return get.error()
 
 if (config.USE_INNERTUBE):
-    # fetches video from innertube.
     @video.route("/getvideo/<video_id>")
     @video.route("/<int:res>/getvideo/<video_id>")
     def getvideo(video_id, res=None):
-        if res is not None or config.MEDIUM_QUALITY is False:
-            
-            # Clamp Res
-            if type(res) == int:
-                res = min(max(res, 144), config.RESMAX)
+        # Process the high-res media download
+        file_path = yt.download_high_res(video_id)
         
-            # Set mimetype since videole device don't recognized it.
-            return Response(yt.hls_video_url(video_id, res), mimetype="application/vnd.apple.mpegurl")
+        if file_path and os.path.exists(file_path):
+            # send_file handles native iOS range headers automatically
+            return send_file(file_path, mimetype="video/mp4")
         
-        # 360p if enabled
-        return redirect(yt.medium_quality_video_url(video_id), 307)
+        # Fallback directly to native 360p streaming if the process fails
+        if config.USE_INNERTUBE:
+            return redirect(yt.medium_quality_video_url(video_id), 307)
+        else:
+            data = get.fetch(f"{config.URL}/api/v1/videos/{video_id}")
+            return redirect(data['formatStreams'][0]['url'], 307)
 else:
     # fetches video from invidious.
     @video.route("/getvideo/<video_id>")

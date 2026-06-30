@@ -7,3 +7,4 @@ requests
 waitress
 requests[socks]
 redis
+yt-dlp

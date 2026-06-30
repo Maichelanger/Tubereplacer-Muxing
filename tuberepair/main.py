@@ -11,6 +11,7 @@ from api.playlist import playlist
 from api.video import video
 from api.channel import channel
 from modules import logs
+from modules.yt import clear_video_cache
 
 if config.CLIENT_TEST:
     from api.client_videos import client_videos
@@ -40,7 +41,12 @@ def catch_docker_stop(*args):
 if __name__ == "__main__":
     print("This Instance ID is ", config.SERVER_ID)
     signal.signal(signal.SIGTERM, catch_docker_stop)
-    if config.DEBUG:
-        app.run(port=config.PORT, host="0.0.0.0", debug=True)
-    else:
-        serve(app, port=config.PORT, host="0.0.0.0")
+
+    try:
+        if config.DEBUG:
+            app.run(port=config.PORT, host="0.0.0.0", debug=True)
+        else:
+            serve(app, port=config.PORT, host="0.0.0.0")
+    finally:
+        from modules.yt import clear_video_cache
+        clear_video_cache()

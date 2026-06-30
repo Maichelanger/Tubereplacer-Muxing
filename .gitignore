@@ -1,8 +1,17 @@
-__pycache__/
-cache/
-.vscode/
+# Ignore the virtual environment folder
+/tuberepair/tuberepair/
 venv/
 .venv/
+
+# Ignore local video downloads and request caches
+/tuberepair/cache*/
+
+# Ignore Python runtime artifacts
+__pycache__/
+*.pyc
+
+# Ignore other files
+serverID.txt
+.vscode/
 .DS_Store
 .env
-*.txt

@@ -2,6 +2,8 @@ import requests_cache, re, config
 from datetime import timedelta
 from modules import helpers, get
 
+import subprocess, os, shutil
+
 # Videos expires after 5 hours, so you don't have to worry.
 session = requests_cache.CachedSession('cache/videos', expire_after=timedelta(hours=4), ignored_parameters=['key'], backend=config.backend)
 
@@ -163,3 +165,44 @@ class metadata:
             "profile_picture": data['header']['pageHeaderRenderer']['content']['pageHeaderViewModel']['image']['decoratedAvatarViewModel']['avatar']['avatarViewModel']['image']['sources'][0]['url'],
             "subscribers": subs
         }
+    
+def clear_video_cache():
+    cache_dir = os.path.join(os.getcwd(), "cache_videos")
+    if os.path.exists(cache_dir):
+        try:
+            shutil.rmtree(cache_dir)
+            print("[TubeRepair] Video cache cleared successfully.")
+        except Exception as e:
+            print(f"[TubeRepair] Could not clear cache folder: {e}")
+
+def download_high_res(video_id):
+    # Set up a local folder for the high-res MP4 files
+    cache_dir = os.path.join(os.getcwd(), "cache_videos")
+    os.makedirs(cache_dir, exist_ok=True)
+    output_file = os.path.join(cache_dir, f"{video_id}.mp4")
+    
+    # If the video was already downloaded previously, serve it instantly
+    if os.path.exists(output_file):
+        print(f"[TubeRepair] Serving cached file for: {video_id}")
+        return output_file
+
+    print(f"[TubeRepair] Downloading & Muxing 720p H.264 for: {video_id}")
+    
+    # Run yt-dlp to download and properly structure the container for iOS
+    cmd = [
+        "yt-dlp",
+        "-f", "bestvideo[height<=720][vcodec^=avc1]+bestaudio[ext=m4a]/best[height<=720][vcodec^=avc1]",
+        "--merge-output-format", "mp4",
+        "--postprocessor-args", "muxer:-movflags +faststart",
+        "-o", output_file,
+        f"https://www.youtube.com/watch?v={video_id}"
+    ]
+    
+    try:
+        # Running without pipe capture lets you monitor download progress directly in PowerShell
+        subprocess.run(cmd, check=True)
+        if os.path.exists(output_file):
+            return output_file
+    except Exception as e:
+        print(f"[TubeRepair] yt-dlp download failed: {e}")
+    return None
