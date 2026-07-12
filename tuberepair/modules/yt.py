@@ -176,33 +176,90 @@ def clear_video_cache():
             print(f"[TubeRepair] Could not clear cache folder: {e}")
 
 def download_high_res(video_id):
+    import glob
+
     # Set up a local folder for the high-res MP4 files
     cache_dir = os.path.join(os.getcwd(), "cache_videos")
     os.makedirs(cache_dir, exist_ok=True)
     output_file = os.path.join(cache_dir, f"{video_id}.mp4")
-    
+
     # If the video was already downloaded previously, serve it instantly
     if os.path.exists(output_file):
         print(f"[TubeRepair] Serving cached file for: {video_id}")
         return output_file
 
-    print(f"[TubeRepair] Downloading & Muxing 720p H.264 for: {video_id}")
-    
-    # Run yt-dlp to download and properly structure the container for iOS
-    cmd = [
+    video_tmpl = os.path.join(cache_dir, f"{video_id}_video.%(ext)s")
+    audio_tmpl = os.path.join(cache_dir, f"{video_id}_audio.%(ext)s")
+    url = f"https://www.youtube.com/watch?v={video_id}"
+
+    video_cmd = [
         "yt-dlp",
-        "-f", "bestvideo[height<=720][vcodec^=avc1]+bestaudio[ext=m4a]/best[height<=720][vcodec^=avc1]",
-        "--merge-output-format", "mp4",
-        "--postprocessor-args", "muxer:-movflags +faststart",
-        "-o", output_file,
-        f"https://www.youtube.com/watch?v={video_id}"
+        "-f", "bestvideo[height<=720][vcodec^=avc1]",
+        "-o", video_tmpl,
+        url
     ]
-    
+    audio_cmd = [
+        "yt-dlp",
+        "-f", "bestaudio[ext=m4a]",
+        "-o", audio_tmpl,
+        url
+    ]
+
+    print(f"[TubeRepair] Downloading 720p video+audio in parallel for: {video_id}")
+
+    video_tmp_path = None
+    audio_tmp_path = None
+
     try:
-        # Running without pipe capture lets you monitor download progress directly in PowerShell
-        subprocess.run(cmd, check=True)
+        # Launch both downloads at the same time instead of sequentially.
+        p_video = subprocess.Popen(video_cmd)
+        p_audio = subprocess.Popen(audio_cmd)
+
+        video_rc = p_video.wait()
+        audio_rc = p_audio.wait()
+
+        if video_rc != 0 or audio_rc != 0:
+            raise RuntimeError(f"yt-dlp exited non-zero (video={video_rc}, audio={audio_rc})")
+
+        video_matches = glob.glob(os.path.join(cache_dir, f"{video_id}_video.*"))
+        audio_matches = glob.glob(os.path.join(cache_dir, f"{video_id}_audio.*"))
+
+        if not video_matches or not audio_matches:
+            raise RuntimeError("Downloaded video/audio file not found after yt-dlp completed")
+
+        video_tmp_path = video_matches[0]
+        audio_tmp_path = audio_matches[0]
+
+        print(f"[TubeRepair] Remuxing (stream copy, no re-encode) for: {video_id}")
+
+        # -c copy = container remux only, no transcoding, so this is fast
+        # regardless of video length. +faststart relocates moov to the
+        # front, which requires the full file to exist first.
+        mux_cmd = [
+            "ffmpeg", "-y",
+            "-i", video_tmp_path,
+            "-i", audio_tmp_path,
+            "-c", "copy",
+            "-movflags", "+faststart",
+            output_file
+        ]
+        subprocess.run(mux_cmd, check=True)
+
         if os.path.exists(output_file):
             return output_file
+
     except Exception as e:
-        print(f"[TubeRepair] yt-dlp download failed: {e}")
+        print(f"[TubeRepair] yt-dlp/ffmpeg download failed: {e}")
+        if os.path.exists(output_file):
+            os.remove(output_file)
+        return None
+    finally:
+        # Clean up the intermediate video/audio-only files either way
+        for tmp_path in (video_tmp_path, audio_tmp_path):
+            if tmp_path and os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except Exception:
+                    pass
+
     return None
