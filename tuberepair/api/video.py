@@ -4,6 +4,7 @@ import config
 from modules.logs import print_with_seperator
 from modules import yt
 import os
+import time
 
 video = Blueprint("video", __name__)
 
@@ -189,6 +190,14 @@ if (config.USE_INNERTUBE):
     @video.route("/getvideo/<video_id>")
     @video.route("/<int:res>/getvideo/<video_id>")
     def getvideo(video_id, res=None):
+
+        if config.USE_HLS_STREAMING:
+            playlist_name = yt.start_hls_stream(video_id)
+            if playlist_name:
+                return redirect(f"/hls/{video_id}/{playlist_name}", 302)
+            # HLS failed to start (resolution failure, ffmpeg missing, etc)
+            # fall through to the MP4 path below instead of erroring out
+
         # Process the high-res media download
         file_path = yt.download_high_res(video_id)
         
@@ -202,6 +211,43 @@ if (config.USE_INNERTUBE):
         else:
             data = get.fetch(f"{config.URL}/api/v1/videos/{video_id}")
             return redirect(data['formatStreams'][0]['url'], 307)
+
+    # Serves the growing .m3u8 playlist and .ts segments for a live HLS
+    # session. touch_hls_session() keeps the session alive as long as the
+    # client keeps requesting it; the reaper thread in yt.py cleans up
+    # sessions nobody's asked for in a while.
+    HLS_SEGMENT_WAIT_TIMEOUT = 30  # seconds to wait for a not-yet-generated segment
+
+    @video.route("/hls/<video_id>/<filename>")
+    def serve_hls_file(video_id, filename):
+        yt.touch_hls_session(video_id)
+        session_dir = yt.hls_session_dir(video_id)
+
+        if not session_dir or not os.path.exists(session_dir):
+            return get.error()
+
+        # Basic guard against path traversal via the filename segment
+        safe_path = os.path.normpath(os.path.join(session_dir, filename))
+        if not safe_path.startswith(os.path.normpath(session_dir)):
+            return get.error()
+
+        # The playlist is written complete upfront, so it's always there
+        # instantly. Segments are still generated in the background in
+        # order, so a segment slightly ahead of what's been produced so
+        # far (readahead buffering, or a modest forward seek) is worth a
+        # short wait instead of failing immediately.
+        if filename.endswith(".ts") and not os.path.exists(safe_path):
+            deadline = time.time() + HLS_SEGMENT_WAIT_TIMEOUT
+            while time.time() < deadline and not os.path.exists(safe_path):
+                if not yt.hls_session_alive(video_id):
+                    break
+                time.sleep(0.3)
+
+        if not os.path.exists(safe_path):
+            return get.error()
+
+        mimetype = "application/vnd.apple.mpegurl" if filename.endswith(".m3u8") else "video/mp2t"
+        return send_file(safe_path, mimetype=mimetype, conditional=True)
 else:
     # fetches video from invidious.
     @video.route("/getvideo/<video_id>")

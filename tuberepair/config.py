@@ -61,6 +61,15 @@ if "HLS_RESOLUTION" in OSEnv:
 else:
     HLS_RESOLUTION = 720
 
+# Use live HLS slicing for /getvideo instead of the full MP4 pre-download.
+# Starts playback almost immediately regardless of video length, at the
+# cost of a background ffmpeg process per active video. Set to False to
+# fall back to the MP4 cache-and-serve behavior.
+if "USE_HLS_STREAMING" in OSEnv:
+    USE_HLS_STREAMING = helpers.string_to_bool(OSEnv["USE_HLS_STREAMING"])
+else:
+    USE_HLS_STREAMING = True
+
 # Set indivious instance
 # NOTE: for info fetching only right now.
 # add http:// or https://

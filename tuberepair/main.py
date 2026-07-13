@@ -44,9 +44,14 @@ if __name__ == "__main__":
 
     try:
         if config.DEBUG:
-            app.run(port=config.PORT, host="0.0.0.0", debug=True)
+            # threaded=True is required now that HLS segment requests can
+            # legitimately block for a few seconds waiting on ffmpeg —
+            # without it, a single waiting request stalls every other
+            # request on the server.
+            app.run(port=config.PORT, host="0.0.0.0", debug=True, threaded=True)
         else:
             serve(app, port=config.PORT, host="0.0.0.0")
     finally:
-        from modules.yt import clear_video_cache
+        from modules.yt import clear_video_cache, clear_all_hls_sessions
+        clear_all_hls_sessions()
         clear_video_cache()
