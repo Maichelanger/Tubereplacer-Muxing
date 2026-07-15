@@ -40,6 +40,9 @@ def catch_docker_stop(*args):
 # config
 if __name__ == "__main__":
     print("This Instance ID is ", config.SERVER_ID)
+    print(f"[TubeRepair] config.py loaded from: {config.__file__}")
+    if config.USE_HLS_STREAMING:
+        print(f"[TubeRepair] HLS video encoder configured as: {config.HLS_VIDEO_ENCODER}")
     signal.signal(signal.SIGTERM, catch_docker_stop)
 
     try:

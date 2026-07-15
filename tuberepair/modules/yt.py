@@ -285,6 +285,108 @@ HLS_IDLE_TIMEOUT = 30       # seconds without a playlist/segment request before 
 HLS_REAP_INTERVAL = 10      # how often the reaper thread checks
 HLS_SEGMENT_SECONDS = 4
 HLS_FIRST_SEGMENT_TIMEOUT = 20  # how long to wait for the first .ts before giving up
+HLS_SEEK_GAP_SEGMENTS = 3  # a request within this many segments of the current write position just waits; further than that triggers a seek-restart
+HLS_SEEK_COOLDOWN_SECONDS = 8  # minimum time between successive reseeks for one session, so a just-launched attempt gets a fair chance before another request can preempt it
+
+# ffmpeg's HTTP demuxer does NOT retry a dropped connection by default.
+# Deliberately NOT using -reconnect_at_eof: it makes ffmpeg treat a
+# normal, complete download's EOF as a possible drop and retry anyway —
+# there's nothing to reconnect to at a genuine EOF, so that retry fails
+# and kills ffmpeg right as it should be finishing cleanly.
+HLS_RECONNECT_OPTS = [
+    "-reconnect", "1",
+    "-reconnect_streamed", "1",
+    "-reconnect_delay_max", "5",
+]
+
+# Video encoder profiles for HLS live-slicing. libx264 (CPU) is the
+# portable default and works on any machine; the others offload the
+# encode to a GPU if the config is set to use one. Preset choices here
+# favor encode speed over compression efficiency, since staying ahead
+# of realtime playback matters far more than file size for this use case.
+HLS_ENCODER_PROFILES = {
+    "libx264": ["-c:v", "libx264", "-preset", "ultrafast"],
+    # -forced-idr 1 is required specifically for nvenc: without it, nvenc
+    # treats -force_key_frames as a mere hint rather than an actual IDR
+    # frame, so the HLS muxer never gets a real cut point to segment at —
+    # it just keeps encoding past every 4-second boundary with nothing
+    # written to disk. libx264 doesn't need this; it honors forced
+    # keyframes as true IDR frames natively.
+    "h264_nvenc": ["-c:v", "h264_nvenc", "-preset", "p1", "-tune", "ll", "-forced-idr", "1"],
+    "h264_amf": ["-c:v", "h264_amf", "-quality", "speed"],
+    "h264_qsv": ["-c:v", "h264_qsv", "-preset", "veryfast"],
+}
+HLS_FALLBACK_ENCODER = "libx264"
+
+
+def _encoder_video_args(encoder_name):
+    """Returns (ffmpeg_args, resolved_name) for a configured encoder,
+    falling back to libx264 with a warning if the name isn't recognized."""
+    if encoder_name not in HLS_ENCODER_PROFILES:
+        print(f"[TubeRepair] Unknown HLS_VIDEO_ENCODER '{encoder_name}' in config.py, "
+              f"falling back to {HLS_FALLBACK_ENCODER}")
+        encoder_name = HLS_FALLBACK_ENCODER
+    return HLS_ENCODER_PROFILES[encoder_name], encoder_name
+
+
+def _build_ffmpeg_cmd(video_info, audio_info, encoder_video_args, ffmpeg_playlist_path,
+                       segment_pattern, seek_seconds=None, start_number=None):
+    """Builds the ffmpeg command for either a fresh encode from the start
+    (seek_seconds/start_number both None) or a seek-restart landing at a
+    specific point (both set) — same shape either way, just with an input
+    seek and a matching segment numbering offset added."""
+    cmd = ["ffmpeg", "-y"]
+
+    video_headers = _build_header_arg(video_info["headers"])
+    if video_headers:
+        cmd += ["-headers", video_headers]
+    cmd += HLS_RECONNECT_OPTS
+    if seek_seconds is not None:
+        cmd += ["-ss", str(seek_seconds)]
+    cmd += ["-i", video_info["url"]]
+
+    audio_headers = _build_header_arg(audio_info["headers"])
+    if audio_headers:
+        cmd += ["-headers", audio_headers]
+    cmd += HLS_RECONNECT_OPTS
+    if seek_seconds is not None:
+        cmd += ["-ss", str(seek_seconds)]
+    cmd += ["-i", audio_info["url"]]
+
+    cmd += ["-map", "0:v", "-map", "1:a"]
+    # -c copy alone can't cut segments at exact boundaries (only at source
+    # keyframes), so we re-encode with a forced keyframe every
+    # HLS_SEGMENT_SECONDS to make the muxer's cuts land where our
+    # precomputed playlist says they will. Audio doesn't need keyframe
+    # alignment, so it stays a stream copy.
+    cmd += encoder_video_args
+    cmd += ["-force_key_frames", f"expr:gte(t,n_forced*{HLS_SEGMENT_SECONDS})"]
+    cmd += [
+        "-c:a", "copy",
+        "-f", "hls",
+        "-hls_time", str(HLS_SEGMENT_SECONDS),
+        "-hls_list_size", "0",
+        "-hls_flags", "append_list",
+    ]
+    if start_number is not None:
+        cmd += ["-start_number", str(start_number)]
+    cmd += ["-hls_segment_filename", segment_pattern, ffmpeg_playlist_path]
+    return cmd
+
+
+def _parse_segment_index(filename):
+    m = re.match(r"^index(\d+)\.ts$", filename)
+    return int(m.group(1)) if m else None
+
+
+def _current_max_segment_index(cache_dir):
+    """Highest segment index currently written to disk, or -1 if none yet."""
+    indices = [
+        _parse_segment_index(os.path.basename(f))
+        for f in glob.glob(os.path.join(cache_dir, "index*.ts"))
+    ]
+    indices = [i for i in indices if i is not None]
+    return max(indices) if indices else -1
 
 _hls_reaper_started = False
 _hls_reaper_lock = threading.Lock()
@@ -403,15 +505,35 @@ def _remove_hls_session(video_id, session):
             print(f"[TubeRepair] Could not remove HLS cache dir for {video_id}: {e}")
 
 
+def _segment_count_on_disk(cache_dir):
+    return len(glob.glob(os.path.join(cache_dir, "index*.ts")))
+
+
 def _hls_reaper_loop():
     while True:
         time.sleep(HLS_REAP_INTERVAL)
         now = time.time()
         with HLS_SESSIONS_LOCK:
-            crashed_ids = [
+            exited = [
                 vid for vid, s in HLS_SESSIONS.items()
                 if s["process"].poll() is not None
             ]
+
+            crashed_ids = [vid for vid in exited if not _session_is_reusable(HLS_SESSIONS[vid])]
+            finished_ids = [vid for vid in exited if vid not in crashed_ids]
+
+            for vid in finished_ids:
+                s = HLS_SESSIONS[vid]
+                expected = s.get("expected_segments")
+                actual = _segment_count_on_disk(s["dir"])
+                # ffmpeg is done and doesn't need supervising anymore, but
+                # leave the files in place — the client may still be
+                # actively playing or could rewind. Let the normal idle
+                # timeout below clean it up like any other session.
+                print(f"[TubeRepair] HLS encode finished cleanly for {vid} "
+                      f"({actual}/{expected if expected is not None else '?'} segments) — "
+                      f"leaving cache in place until idle")
+
             idle_ids = [
                 vid for vid, s in HLS_SESSIONS.items()
                 if vid not in crashed_ids and now - s["last_access"] > HLS_IDLE_TIMEOUT
@@ -453,6 +575,159 @@ def hls_session_alive(video_id):
         return bool(session and session["process"].poll() is None)
 
 
+def _session_is_reusable(session):
+    """True if a session is either still actively producing segments, or
+    finished cleanly having reached the true end — either way, safe to
+    serve from without re-encoding. False means it crashed partway and
+    shouldn't be reused.
+
+    Checks the highest segment index reached rather than the exact
+    segment count: a seek-restart can legitimately leave a gap in the
+    middle (segments between where the old run stopped and where the new
+    one picked up) even on an otherwise fully successful run that reaches
+    the real end of the video."""
+    proc = session["process"]
+    if proc.poll() is None:
+        return True  # still running
+    expected = session.get("expected_segments")
+    if expected is None:
+        return proc.returncode == 0
+    current_max = _current_max_segment_index(session["dir"])
+    return proc.returncode == 0 and current_max >= expected - 1
+
+
+def _reseek_hls_stream(video_id, target_index):
+    """Restarts the encode starting at a specific segment's timestamp, so
+    a far scrub doesn't require waiting for linear encoding to catch up.
+    Segments already on disk before/after the seek point are left as-is;
+    new ones are written starting at target_index. Locked per-session so
+    concurrent requests for the same jump don't race into launching
+    multiple ffmpeg processes."""
+    with HLS_SESSIONS_LOCK:
+        session = HLS_SESSIONS.get(video_id)
+    if not session:
+        return
+
+    with session["reseek_lock"]:
+        # Re-check after acquiring the lock — another thread may have
+        # already performed this exact seek, or generation may have
+        # naturally caught up in the meantime.
+        target_path = os.path.join(session["dir"], f"index{target_index}.ts")
+        if os.path.exists(target_path):
+            return
+
+        # Cooldown: don't preempt an attempt that just started. iOS fires
+        # a burst of readahead requests around a seek point — without
+        # this, each one restarts ffmpeg again before the previous
+        # restart ever gets a chance to write anything, permanently
+        # resetting progress and stalling on one segment forever.
+        last_seek = session.get("last_seek_time", 0)
+        if time.time() - last_seek < HLS_SEEK_COOLDOWN_SECONDS:
+            return
+
+        current_max = _current_max_segment_index(session["dir"])
+        if current_max < target_index <= current_max + HLS_SEEK_GAP_SEGMENTS:
+            return  # close enough now, normal linear generation will reach it
+
+        seek_seconds = target_index * HLS_SEGMENT_SECONDS
+        print(f"[TubeRepair] Seeking HLS encode for {video_id} to segment {target_index} "
+              f"(~{seek_seconds}s)")
+
+        _stop_hls_process(session["process"])
+        old_log_file = session.get("log_file")
+        if old_log_file:
+            try:
+                old_log_file.close()
+            except Exception:
+                pass
+
+        # ffmpeg's own internal playlist (never actually read by us — we
+        # serve our own, written upfront) needs to be wiped before each
+        # reseek. -hls_flags append_list makes ffmpeg resume its internal
+        # sequence counter from whatever this file last recorded, which
+        # silently overrides -start_number and writes segments under the
+        # OLD run's numbering instead of the new target. That's what was
+        # making the target segment never appear — ffmpeg kept producing
+        # output, just under the wrong filenames.
+        for stale_path in (session["ffmpeg_playlist_path"], session["ffmpeg_playlist_path"] + ".tmp"):
+            if os.path.exists(stale_path):
+                try:
+                    os.remove(stale_path)
+                except Exception:
+                    pass
+
+        encoder_name = session.get("encoder_name", config.HLS_VIDEO_ENCODER)
+        video_args, resolved_name = _encoder_video_args(encoder_name)
+        cmd = _build_ffmpeg_cmd(
+            session["video_info"], session["audio_info"], video_args,
+            session["ffmpeg_playlist_path"], session["segment_pattern"],
+            seek_seconds=seek_seconds, start_number=target_index
+        )
+
+        log_path = session["log_path"]
+        try:
+            log_file = open(log_path, "a", encoding="utf-8", errors="replace")
+            log_file.write(f"\n\n--- seeking to segment {target_index} (~{seek_seconds}s) ---\n\n")
+            proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=log_file,
+                stderr=log_file,
+                text=True
+            )
+        except Exception as e:
+            print(f"[TubeRepair] Failed to relaunch ffmpeg for seek on {video_id}: {e}")
+            return
+
+        with HLS_SESSIONS_LOCK:
+            if video_id in HLS_SESSIONS:
+                HLS_SESSIONS[video_id]["process"] = proc
+                HLS_SESSIONS[video_id]["log_file"] = log_file
+                HLS_SESSIONS[video_id]["last_access"] = time.time()
+                HLS_SESSIONS[video_id]["last_seek_time"] = time.time()
+
+
+def ensure_hls_segment(video_id, filename, wait_timeout=30):
+    """Makes sure a requested HLS file is available before it's served.
+    For a segment far from the current write position (a deliberate
+    scrub, not just normal readahead), triggers a seek-restart instead of
+    passively waiting. Returns True if the file became available."""
+    session_dir = hls_session_dir(video_id)
+    if not session_dir:
+        return False
+
+    target_path = os.path.join(session_dir, filename)
+    if os.path.exists(target_path):
+        return True
+
+    target_index = _parse_segment_index(filename)
+    if target_index is not None:
+        current_max = _current_max_segment_index(session_dir)
+        needs_seek = (target_index <= current_max) or (target_index > current_max + HLS_SEEK_GAP_SEGMENTS)
+        if needs_seek:
+            _reseek_hls_stream(video_id, target_index)
+
+    deadline = time.time() + wait_timeout
+    while time.time() < deadline:
+        if os.path.exists(target_path):
+            return True
+        if not hls_session_alive(video_id):
+            break  # nothing more will be written; one last check below
+        time.sleep(0.3)
+
+    if os.path.exists(target_path):
+        return True
+
+    # Give up — print diagnostics so a failure is visible instead of just
+    # a silent 404, whether it's a crash, a slow seek, or anything else.
+    print(f"[TubeRepair] Gave up waiting for {filename} on {video_id} after {wait_timeout}s")
+    with HLS_SESSIONS_LOCK:
+        session = HLS_SESSIONS.get(video_id)
+    if session:
+        _print_log_tail(session.get("log_path", ""))
+    return False
+
+
 def start_hls_stream(video_id):
     """Starts (or reuses) a live HLS slicing session for a video. Blocks
     only until the first segment is written (~1-2s), not the full video.
@@ -462,7 +737,7 @@ def start_hls_stream(video_id):
 
     with HLS_SESSIONS_LOCK:
         existing = HLS_SESSIONS.get(video_id)
-        if existing and existing["process"].poll() is None:
+        if existing and _session_is_reusable(existing):
             existing["last_access"] = time.time()
             return existing["playlist"]
 
@@ -478,128 +753,116 @@ def start_hls_stream(video_id):
     ffmpeg_playlist_path = os.path.join(cache_dir, "_ffmpeg_internal.m3u8")
     segment_pattern = os.path.join(cache_dir, "index%d.ts")
 
-    print(f"[TubeRepair] Resolving CDN URLs for HLS session: {video_id}")
-    try:
-        video_info = _resolve_direct_url(video_id, "bestvideo[height<=720][vcodec^=avc1]")
-        audio_info = _resolve_direct_url(video_id, "bestaudio[ext=m4a]")
-    except Exception as e:
-        print(f"[TubeRepair] Failed to resolve HLS source URLs for {video_id}: {e}")
-        return None
+    # Retried at this level (not just per-encoder) because a CDN URL can
+    # come back stale/rejected (403) independent of which encoder is
+    # used — retrying the encoder with the SAME bad URL never helps.
+    # Re-resolving gets a brand-new URL, same as how the MP4 fallback
+    # path already succeeds by calling yt-dlp fresh at download time.
+    HLS_RESOLUTION_ATTEMPTS = 2
+    for attempt in range(1, HLS_RESOLUTION_ATTEMPTS + 1):
+        served_playlist_path = os.path.join(cache_dir, "index.m3u8")  # reset in case a prior attempt fell back to the live-style playlist
+        suffix = f" (attempt {attempt}/{HLS_RESOLUTION_ATTEMPTS})" if attempt > 1 else ""
+        print(f"[TubeRepair] Resolving CDN URLs for HLS session: {video_id}{suffix}")
+        try:
+            video_info = _resolve_direct_url(video_id, "bestvideo[height<=720][vcodec^=avc1]")
+            audio_info = _resolve_direct_url(video_id, "bestaudio[ext=m4a]")
+        except Exception as e:
+            print(f"[TubeRepair] Failed to resolve HLS source URLs for {video_id}: {e}")
+            continue
 
-    duration = video_info.get("duration") or audio_info.get("duration")
-    if duration:
-        _write_vod_playlist(served_playlist_path, duration)
-    else:
-        # No duration metadata available (unusual, e.g. an actual live
-        # stream) — fall back to letting ffmpeg's own live-style playlist
-        # be the one we serve directly, same as before this change.
-        print(f"[TubeRepair] No duration metadata for {video_id}, falling back to live-style playlist")
-        served_playlist_path = ffmpeg_playlist_path
+        duration = video_info.get("duration") or audio_info.get("duration")
+        expected_segments = None
+        if duration:
+            expected_segments = _write_vod_playlist(served_playlist_path, duration)
+        else:
+            # No duration metadata available (unusual, e.g. an actual live
+            # stream) — fall back to letting ffmpeg's own live-style playlist
+            # be the one we serve directly, same as before this change.
+            print(f"[TubeRepair] No duration metadata for {video_id}, falling back to live-style playlist")
+            served_playlist_path = ffmpeg_playlist_path
 
-    # Reconnect flags: ffmpeg's HTTP demuxer does NOT retry a dropped
-    # connection by default. Over a long pull from two separate CDN
-    # connections, a single transient mid-stream blip is normal — without
-    # these, that blip kills the whole ffmpeg process instead of retrying.
-    #
-    # Deliberately NOT using -reconnect_at_eof here: that flag makes ffmpeg
-    # treat a normal, complete download's end-of-file as a possible dropped
-    # connection and retry anyway. There's nothing to reconnect to at a
-    # genuine EOF, so the retry fails and kills ffmpeg right as it should
-    # be finishing cleanly — this is what was cutting the last few segments
-    # off shorter videos.
-    reconnect_opts = [
-        "-reconnect", "1",
-        "-reconnect_streamed", "1",
-        "-reconnect_delay_max", "5",
-    ]
+        def _try_launch(encoder_name):
+            """Launches ffmpeg with the given encoder and waits for the first
+            segment. Returns the playlist filename on success, or None on
+            failure (process dies, or times out) — cleaning up its own
+            partial attempt either way so a retry with a different encoder
+            starts from a clean directory."""
+            video_args, resolved_name = _encoder_video_args(encoder_name)
+            cmd = _build_ffmpeg_cmd(video_info, audio_info, video_args, ffmpeg_playlist_path, segment_pattern)
 
-    cmd = ["ffmpeg", "-y"]
-    video_headers = _build_header_arg(video_info["headers"])
-    if video_headers:
-        cmd += ["-headers", video_headers]
-    cmd += reconnect_opts
-    cmd += ["-i", video_info["url"]]
+            print(f"[TubeRepair] Starting HLS live-slicing for: {video_id} (encoder: {resolved_name})")
+            log_path = os.path.join(cache_dir, "ffmpeg.log")
+            try:
+                log_file = open(log_path, "w", encoding="utf-8", errors="replace")
+                proc = subprocess.Popen(
+                    cmd,
+                    stdin=subprocess.PIPE,
+                    stdout=log_file,
+                    stderr=log_file,
+                    text=True
+                )
+            except Exception as e:
+                print(f"[TubeRepair] Failed to launch ffmpeg for {video_id}: {e}")
+                return None
 
-    audio_headers = _build_header_arg(audio_info["headers"])
-    if audio_headers:
-        cmd += ["-headers", audio_headers]
-    cmd += reconnect_opts
-    cmd += ["-i", audio_info["url"]]
+            with HLS_SESSIONS_LOCK:
+                HLS_SESSIONS[video_id] = {
+                    "process": proc,
+                    "dir": cache_dir,
+                    "last_access": time.time(),
+                    "playlist": os.path.basename(served_playlist_path),
+                    "log_file": log_file,
+                    "log_path": log_path,
+                    "expected_segments": expected_segments,
+                    "video_info": video_info,
+                    "audio_info": audio_info,
+                    "encoder_name": resolved_name,
+                    "reseek_lock": threading.Lock(),
+                    "segment_pattern": segment_pattern,
+                    "ffmpeg_playlist_path": ffmpeg_playlist_path,
+                }
 
-    cmd += [
-        "-map", "0:v", "-map", "1:a",
-        # -c copy was the original approach here, but it means ffmpeg's
-        # HLS muxer can only cut a segment at a keyframe boundary in the
-        # SOURCE video — it can't force an exact 4-second cut without
-        # re-encoding. Real keyframe spacing is usually 5-6s, not 4s, so
-        # actual segments came out longer (and fewer) than our upfront
-        # VOD playlist assumed, and the deficit compounded with video
-        # length. That's what was leaving the last several playlist
-        # entries pointing at .ts files that never got created.
-        #
-        # Forcing a keyframe every HLS_SEGMENT_SECONDS makes the muxer's
-        # cuts land where our playlist actually says they will. Audio
-        # doesn't need keyframe alignment, so it stays a stream copy.
-        "-c:v", "libx264",
-        "-preset", "ultrafast",
-        "-force_key_frames", f"expr:gte(t,n_forced*{HLS_SEGMENT_SECONDS})",
-        "-c:a", "copy",
-        "-f", "hls",
-        "-hls_time", str(HLS_SEGMENT_SECONDS),
-        "-hls_list_size", "0",
-        "-hls_flags", "append_list",
-        "-hls_segment_filename", segment_pattern,
-        ffmpeg_playlist_path
-    ]
+            deadline = time.time() + HLS_FIRST_SEGMENT_TIMEOUT
+            while time.time() < deadline:
+                if proc.poll() is not None:
+                    print(f"[TubeRepair] ffmpeg ({resolved_name}) exited early for {video_id} "
+                          f"(code {proc.returncode})")
+                    _print_log_tail(log_path)
+                    with HLS_SESSIONS_LOCK:
+                        HLS_SESSIONS.pop(video_id, None)
+                    log_file.close()
+                    return None
+                if glob.glob(os.path.join(cache_dir, "*.ts")):
+                    return os.path.basename(served_playlist_path)
+                time.sleep(0.3)
 
-    print(f"[TubeRepair] Starting HLS live-slicing for: {video_id}")
-    log_path = os.path.join(cache_dir, "ffmpeg.log")
-    try:
-        log_file = open(log_path, "w", encoding="utf-8", errors="replace")
-        proc = subprocess.Popen(
-            cmd,
-            stdin=subprocess.PIPE,
-            stdout=log_file,
-            stderr=log_file,
-            text=True
-        )
-    except Exception as e:
-        print(f"[TubeRepair] Failed to launch ffmpeg for {video_id}: {e}")
-        return None
-
-    with HLS_SESSIONS_LOCK:
-        HLS_SESSIONS[video_id] = {
-            "process": proc,
-            "dir": cache_dir,
-            "last_access": time.time(),
-            "playlist": os.path.basename(served_playlist_path),
-            "log_file": log_file,
-            "log_path": log_path,
-        }
-
-    # Wait for the first segment to appear so we don't redirect the client
-    # to a playlist that isn't playable yet.
-    deadline = time.time() + HLS_FIRST_SEGMENT_TIMEOUT
-    while time.time() < deadline:
-        if proc.poll() is not None:
-            print(f"[TubeRepair] ffmpeg exited early for {video_id} (code {proc.returncode})")
+            print(f"[TubeRepair] Timed out waiting for first HLS segment ({resolved_name}): {video_id}")
             _print_log_tail(log_path)
             with HLS_SESSIONS_LOCK:
-                HLS_SESSIONS.pop(video_id, None)
-            log_file.close()
-            shutil.rmtree(cache_dir, ignore_errors=True)
+                session = HLS_SESSIONS.pop(video_id, None)
+            if session:
+                _remove_hls_session(video_id, session)
             return None
-        if glob.glob(os.path.join(cache_dir, "*.ts")):
-            return os.path.basename(served_playlist_path)
-        time.sleep(0.3)
 
-    # Timed out waiting — kill this attempt rather than leaving a zombie process.
-    print(f"[TubeRepair] Timed out waiting for first HLS segment: {video_id}")
-    _print_log_tail(log_path)
-    with HLS_SESSIONS_LOCK:
-        session = HLS_SESSIONS.pop(video_id, None)
-    if session:
-        _remove_hls_session(video_id, session)
+        result = _try_launch(config.HLS_VIDEO_ENCODER)
+        if result is None and config.HLS_VIDEO_ENCODER != HLS_FALLBACK_ENCODER:
+            print(f"[TubeRepair] '{config.HLS_VIDEO_ENCODER}' failed for {video_id} "
+                  f"— retrying with {HLS_FALLBACK_ENCODER}")
+            shutil.rmtree(cache_dir, ignore_errors=True)
+            os.makedirs(cache_dir, exist_ok=True)
+            if duration:
+                _write_vod_playlist(served_playlist_path, duration)
+            result = _try_launch(HLS_FALLBACK_ENCODER)
+
+        if result is not None:
+            return result
+
+        if attempt < HLS_RESOLUTION_ATTEMPTS:
+            print(f"[TubeRepair] Both encoder attempts failed for {video_id} "
+                  f"— re-resolving fresh CDN URLs and retrying")
+            shutil.rmtree(cache_dir, ignore_errors=True)
+            os.makedirs(cache_dir, exist_ok=True)
+
     return None
 
 

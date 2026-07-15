@@ -232,18 +232,14 @@ if (config.USE_INNERTUBE):
             return get.error()
 
         # The playlist is written complete upfront, so it's always there
-        # instantly. Segments are still generated in the background in
-        # order, so a segment slightly ahead of what's been produced so
-        # far (readahead buffering, or a modest forward seek) is worth a
-        # short wait instead of failing immediately.
-        if filename.endswith(".ts") and not os.path.exists(safe_path):
-            deadline = time.time() + HLS_SEGMENT_WAIT_TIMEOUT
-            while time.time() < deadline and not os.path.exists(safe_path):
-                if not yt.hls_session_alive(video_id):
-                    break
-                time.sleep(0.3)
-
-        if not os.path.exists(safe_path):
+        # instantly. Segments may need to wait for normal linear generation
+        # to catch up, or (for a request far from the current write
+        # position — a deliberate scrub) trigger a seek-restart of the
+        # encode — ensure_hls_segment handles both.
+        if filename.endswith(".ts"):
+            if not yt.ensure_hls_segment(video_id, filename, wait_timeout=HLS_SEGMENT_WAIT_TIMEOUT):
+                return get.error()
+        elif not os.path.exists(safe_path):
             return get.error()
 
         mimetype = "application/vnd.apple.mpegurl" if filename.endswith(".m3u8") else "video/mp2t"

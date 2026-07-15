@@ -70,6 +70,21 @@ if "USE_HLS_STREAMING" in OSEnv:
 else:
     USE_HLS_STREAMING = True
 
+# Which encoder HLS live-slicing uses to re-encode video (needed so
+# ffmpeg can cut segments at exact boundaries — see modules/yt.py for why).
+# "libx264" (CPU, default) works everywhere and needs nothing extra
+# installed. If you have a GPU and want to offload the encode:
+#   "h264_nvenc"  - NVIDIA (requires nvenc-capable driver)
+#   "h264_amf"    - AMD
+#   "h264_qsv"    - Intel QuickSync
+# If the configured hardware encoder fails to initialize (e.g. this repo
+# gets shared with someone without that GPU), it automatically falls
+# back to libx264 rather than breaking streaming entirely.
+if "HLS_VIDEO_ENCODER" in OSEnv:
+    HLS_VIDEO_ENCODER = OSEnv["HLS_VIDEO_ENCODER"]
+else:
+    HLS_VIDEO_ENCODER = "libx264"
+
 # Set indivious instance
 # NOTE: for info fetching only right now.
 # add http:// or https://
