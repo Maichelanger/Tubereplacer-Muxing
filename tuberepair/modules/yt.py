@@ -10,21 +10,6 @@ session = requests_cache.CachedSession('cache/videos', expire_after=timedelta(ho
 # hard-coded API Key, from youtube's private API
 api_key = 'AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8'
 
-# Get HLS URL via innertube and fetch the file, then filter to fix low quality playback error
-# Much thanks for SpaceSaver.
-def hls_video_url(video_id, res=None):
-
-    # using IOS client since Apple invented HLS
-    json_data = {
-        "context": {"client": {
-            "clientName": "IOS",
-            "clientVersion": "19.16.3"
-        }},
-        "videoId": video_id
-    }
-    
-    # fetch innertube
-    data = session.post('https://www.youtube.com/youtubei/v1/player?key=' + api_key, json=json_data, proxies=helpers.proxies).json()
 def data_to_hls_url(data, res = None):
     # get video's m3u8 to process it.
     panda = session.get(data["streamingData"]["hlsManifestUrl"], proxies=helpers.proxies).text.split("\n")
@@ -281,7 +266,7 @@ def download_high_res(video_id):
 
 HLS_SESSIONS = {}          # video_id -> {process, dir, last_access}
 HLS_SESSIONS_LOCK = threading.Lock()
-HLS_IDLE_TIMEOUT = 30       # seconds without a playlist/segment request before we kill the session
+HLS_IDLE_TIMEOUT = 90       # seconds without a playlist/segment request (or new segment being written) before we kill the session
 HLS_REAP_INTERVAL = 10      # how often the reaper thread checks
 HLS_SEGMENT_SECONDS = 4
 HLS_FIRST_SEGMENT_TIMEOUT = 20  # how long to wait for the first .ts before giving up
@@ -533,6 +518,19 @@ def _hls_reaper_loop():
                 print(f"[TubeRepair] HLS encode finished cleanly for {vid} "
                       f"({actual}/{expected if expected is not None else '?'} segments) — "
                       f"leaving cache in place until idle")
+
+            # A session is still "active" if either the client has asked
+            # for something recently, OR ffmpeg has written new segments
+            # since the last check — a well-buffered client can legitimately
+            # go quiet for a while without requesting anything while ffmpeg
+            # keeps producing output in the background. Without this second
+            # check, that gets mistaken for an abandoned session and reaped
+            # out from under someone who's still actively watching.
+            for vid, s in HLS_SESSIONS.items():
+                current_max = _current_max_segment_index(s["dir"])
+                if current_max > s.get("last_known_max_segment", -1):
+                    s["last_known_max_segment"] = current_max
+                    s["last_access"] = now
 
             idle_ids = [
                 vid for vid, s in HLS_SESSIONS.items()
@@ -879,3 +877,30 @@ def clear_all_hls_sessions():
         HLS_SESSIONS.clear()
     for vid, session in sessions.items():
         _remove_hls_session(vid, session)
+
+
+# A stable, essentially-permanent video used only to warm up yt-dlp's
+# session cache at startup — the first video ever uploaded to YouTube.
+_HLS_WARMUP_VIDEO_ID = "jNQXAC9IVRw"
+
+
+def warm_up_yt_dlp():
+    """Runs one throwaway URL resolution at server startup so any stale
+    cached session state in yt-dlp (PO tokens, cipher functions, etc.)
+    gets refreshed before a real request hits it. Without this, the
+    first resolution after the server (or yt-dlp's own cache) has been
+    idle a while can come back with a CDN URL that gets rejected with a
+    403 — the automatic re-resolve-and-retry in start_hls_stream already
+    recovers from that in a few seconds, but this avoids the failure
+    (and its delay) entirely for that first click. Runs in a background
+    thread so it never blocks server startup; failures here are silent
+    and harmless — the normal retry logic is still the real safety net."""
+    def _run():
+        try:
+            print("[TubeRepair] Warming up yt-dlp session cache...")
+            _resolve_direct_url(_HLS_WARMUP_VIDEO_ID, "bestaudio[ext=m4a]")
+            print("[TubeRepair] yt-dlp session cache warmed up.")
+        except Exception as e:
+            print(f"[TubeRepair] yt-dlp warm-up failed (harmless — normal retry logic still applies): {e}")
+
+    threading.Thread(target=_run, daemon=True).start()
