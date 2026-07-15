@@ -8,13 +8,25 @@ Python (3.8 minimum) is required.
 You'll also need to [download ffmpeg essentials from here](https://www.gyan.dev/ffmpeg/builds/).
 Then, extract the folder wherever you want (The root of C:, for example) and register the "bin" folder on the PATH system environment variable.
 
-Finally, clone or download the project, open a terminal at ".\tuberepair" and input:
+Finally, clone or download the project, open a terminal at ".\tuberepair" (the folder with that name), install and cofigure the server with the following commands:
 ```bash
 python -m venv tuberepair
 .\tuberepair\Scripts\Activate.ps1
 pip install -r requirements.txt
 
+# Set your encoder: "h264_nvenc" (nvenc-capable Nvidia GPU), "h264_amf" (AMD GPU), "h264_qsv" (Intel QuickSync)
+# You can set it to "libx264" (Software/CPU), but it already falls back to that encoder if the first one fails/isn't set up anyway.
+setx HLS_VIDEO_ENCODER "YOUR_OPTION_HERE"
+
 # Run server
+python main.py
+```
+
+To stop the server, just hit CTRL+C (It will give an error but it's not critical. Only cosmetic)
+
+To start it again, open a terminal in ".\tuberepair" and input:
+```bash
+.\tuberepair\Scripts\Activate.ps1
 python main.py
 ```
 
