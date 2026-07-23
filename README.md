@@ -7,8 +7,9 @@ Python (3.8 minimum) is required.
 
 You'll also need to [download ffmpeg essentials from here](https://www.gyan.dev/ffmpeg/builds/).
 Then, extract the folder wherever you want (The root of C:, for example) and register the "bin" folder on the PATH system environment variable.
+[(Here's how to if you don't know how to do it)](https://gist.github.com/janAkali/338e6bf143fcd0161a2f0d768b938e4b)
 
-Finally, clone or download the project, open a terminal at ".\tuberepair" (the folder with that name), install and cofigure the server with the following commands:
+Finally, clone or download the project, open a terminal at ".\tuberepair" (the only folder besides the GitHub files), install and cofigure the server with the following commands:
 ```bash
 python -m venv tuberepair
 .\tuberepair\Scripts\Activate.ps1
@@ -37,7 +38,7 @@ If you're using TubeReplacer:
 - Set the "Custom Stream URL" to the URL the console tells you the server opened at and add __/getvideo/%v__ at the end (Ex. http://192.168.1.120/getvideo/%v)
 
 # Extra notes
-- The server downloads the videos to convert them first, so long videos will take a while to load.
+- The server will try to stream the video as soon as it starts receiving segments. But if it fails, it downloads the videos instead to convert them into a format old iOS can play, so long videos will take a while to load.
 - The cache gets cleared at closing the server (With CTRL+C).
 - For now, I won't be making a Docker option. I'm not familiar with it yet and I prefer to get the project working properly first.
 - The stream is always 720p. But depending on the video, it may be 30 or 60 fps.
