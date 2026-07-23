@@ -365,13 +365,33 @@ def _parse_segment_index(filename):
 
 
 def _current_max_segment_index(cache_dir):
-    """Highest segment index currently written to disk, or -1 if none yet."""
+    """Highest segment index currently written to disk, or -1 if none yet.
+    Reflects EVERY file present, including leftovers from an earlier run
+    or reseek — use _contiguous_max_from instead when you need to know
+    where the currently active encode has actually gotten to."""
     indices = [
         _parse_segment_index(os.path.basename(f))
         for f in glob.glob(os.path.join(cache_dir, "index*.ts"))
     ]
     indices = [i for i in indices if i is not None]
     return max(indices) if indices else -1
+
+
+def _contiguous_max_from(cache_dir, start_index):
+    """Highest N such that every index from start_index..N exists on disk
+    contiguously. Used to measure how far the CURRENTLY ACTIVE encode run
+    has actually progressed — unlike _current_max_segment_index, this
+    ignores unrelated leftover segments from a previous run/reseek that
+    happen to sit at higher indices but aren't part of what's actively
+    being written right now. Without this distinction, a stale leftover
+    segment near a requested-but-missing one can make the gap-check think
+    "close enough, just wait" when the active encode is nowhere near
+    there — the request then waits the full timeout and fails, since the
+    slow-climbing active run was never going to reach it in time."""
+    n = start_index
+    while os.path.exists(os.path.join(cache_dir, f"index{n}.ts")):
+        n += 1
+    return n - 1
 
 _hls_reaper_started = False
 _hls_reaper_lock = threading.Lock()
@@ -527,9 +547,10 @@ def _hls_reaper_loop():
             # check, that gets mistaken for an abandoned session and reaped
             # out from under someone who's still actively watching.
             for vid, s in HLS_SESSIONS.items():
-                current_max = _current_max_segment_index(s["dir"])
-                if current_max > s.get("last_known_max_segment", -1):
-                    s["last_known_max_segment"] = current_max
+                run_start = s.get("run_start_index", 0)
+                current_progress = _contiguous_max_from(s["dir"], run_start)
+                if current_progress > s.get("last_known_max_segment", -1):
+                    s["last_known_max_segment"] = current_progress
                     s["last_access"] = now
 
             idle_ids = [
@@ -614,17 +635,33 @@ def _reseek_hls_stream(video_id, target_index):
         if os.path.exists(target_path):
             return
 
-        # Cooldown: don't preempt an attempt that just started. iOS fires
-        # a burst of readahead requests around a seek point — without
-        # this, each one restarts ffmpeg again before the previous
-        # restart ever gets a chance to write anything, permanently
-        # resetting progress and stalling on one segment forever.
+        # Cooldown: don't preempt an attempt that just started — but ONLY
+        # when the new request is near-duplicate noise around the SAME
+        # jump (iOS readahead firing a burst of requests right after a
+        # seek). If the new target is meaningfully different, it's a
+        # genuine, distinct seek the user made, and blocking it just
+        # because it came soon after another one means waiting on a run
+        # that was never heading there — that's what actually caused a
+        # stall on a single fresh session with zero leftover segments
+        # (seeked to 161, then to 187 eight seconds later; the cooldown
+        # blocked the second jump, so it passively waited on a run that
+        # would've taken ~50s to organically reach 187, well past the
+        # 30s timeout).
         last_seek = session.get("last_seek_time", 0)
-        if time.time() - last_seek < HLS_SEEK_COOLDOWN_SECONDS:
+        run_start = session.get("run_start_index", 0)
+        target_is_near_prior_jump = abs(target_index - run_start) <= HLS_SEEK_GAP_SEGMENTS
+        if target_is_near_prior_jump and time.time() - last_seek < HLS_SEEK_COOLDOWN_SECONDS:
             return
 
-        current_max = _current_max_segment_index(session["dir"])
-        if current_max < target_index <= current_max + HLS_SEEK_GAP_SEGMENTS:
+        # How far the CURRENTLY active run has actually gotten — not the
+        # highest file on disk overall, which can include unrelated
+        # leftover segments from an earlier run/reseek sitting at higher
+        # indices. Using raw disk-max here caused the exact "stuck
+        # forever" bug: a leftover segment near the target made this look
+        # "close enough, just wait" even though the real active encode
+        # was far behind and would never reach it in time.
+        run_progress = _contiguous_max_from(session["dir"], run_start)
+        if run_progress < target_index <= run_progress + HLS_SEEK_GAP_SEGMENTS:
             return  # close enough now, normal linear generation will reach it
 
         seek_seconds = target_index * HLS_SEGMENT_SECONDS
@@ -683,6 +720,8 @@ def _reseek_hls_stream(video_id, target_index):
                 HLS_SESSIONS[video_id]["log_file"] = log_file
                 HLS_SESSIONS[video_id]["last_access"] = time.time()
                 HLS_SESSIONS[video_id]["last_seek_time"] = time.time()
+                HLS_SESSIONS[video_id]["run_start_index"] = target_index
+                HLS_SESSIONS[video_id]["last_known_max_segment"] = target_index - 1
 
 
 def ensure_hls_segment(video_id, filename, wait_timeout=30):
@@ -700,10 +739,20 @@ def ensure_hls_segment(video_id, filename, wait_timeout=30):
 
     target_index = _parse_segment_index(filename)
     if target_index is not None:
-        current_max = _current_max_segment_index(session_dir)
-        needs_seek = (target_index <= current_max) or (target_index > current_max + HLS_SEEK_GAP_SEGMENTS)
-        if needs_seek:
-            _reseek_hls_stream(video_id, target_index)
+        with HLS_SESSIONS_LOCK:
+            session = HLS_SESSIONS.get(video_id)
+        if session:
+            run_start = session.get("run_start_index", 0)
+            run_progress = _contiguous_max_from(session_dir, run_start)
+            # Using the ACTIVE run's own progress here, not raw disk-max —
+            # a leftover segment from an earlier run/reseek can sit at a
+            # much higher index than where encoding is actually at right
+            # now, which previously made a genuinely-far request look
+            # "close enough, just wait" when the real active encode was
+            # nowhere near reaching it in time.
+            needs_seek = (target_index <= run_progress) or (target_index > run_progress + HLS_SEEK_GAP_SEGMENTS)
+            if needs_seek:
+                _reseek_hls_stream(video_id, target_index)
 
     deadline = time.time() + wait_timeout
     while time.time() < deadline:
@@ -818,6 +867,8 @@ def start_hls_stream(video_id):
                     "reseek_lock": threading.Lock(),
                     "segment_pattern": segment_pattern,
                     "ffmpeg_playlist_path": ffmpeg_playlist_path,
+                    "run_start_index": 0,
+                    "last_known_max_segment": -1,
                 }
 
             deadline = time.time() + HLS_FIRST_SEGMENT_TIMEOUT
